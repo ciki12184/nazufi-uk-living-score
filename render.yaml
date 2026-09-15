@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: nazufi-living-score-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    plan: starter
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /data/nazufi_living_score.db
+      - key: ALLOWED_ORIGINS
+        value: https://www.nazufienterprise.com,https://nazufienterprise.com
+      - key: ADMIN_TOKEN
+        generateValue: true
+    disk:
+      name: nazufi-living-score-data
+      mountPath: /data
+      sizeGB: 5
