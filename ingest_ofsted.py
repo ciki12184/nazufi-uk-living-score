@@ -1,5 +1,4 @@
 import csv, json, re
-from pathlib import Path
 from bulk_common import download_to_staging, sha256_file, utcnow
 from discover_sources import discover_latest_ofsted_csv
 from db import connect
@@ -29,6 +28,22 @@ def validate_headers(headers):
             return False, f"Missing expected field group: {sorted(group)}"
     return True, "ok"
 
+def open_ofsted_csv(path):
+    last_error = None
+    for encoding in ("utf-8-sig", "cp1252"):
+        try:
+            f = open(path, "r", encoding=encoding, newline="")
+            f.read(8192)
+            f.seek(0)
+            return f, encoding
+        except UnicodeDecodeError as exc:
+            last_error = exc
+            try:
+                f.close()
+            except Exception:
+                pass
+    raise RuntimeError(f"Ofsted CSV encoding could not be decoded safely: {last_error}")
+
 def ingest():
     info = discover_latest_ofsted_csv()
     path = download_to_staging(info["url"], "ofsted_latest.csv")
@@ -44,7 +59,8 @@ def ingest():
         con.close()
         return {"status": "unchanged", "sha256": digest}
 
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+    f, encoding_used = open_ofsted_csv(path)
+    try:
         reader = csv.DictReader(f)
         ok, msg = validate_headers(reader.fieldnames or [])
         if not ok:
@@ -61,6 +77,59 @@ def ingest():
             staged.append((
                 urn, name, postcode,
                 find_field(row, ["local_authority", "la_name"]),
+                find_field(row, ["phase_of_education", "phase"]),
+                find_field(row, ["inspection_end_date", "inspection_date", "latest_inspection_date"]),
+                find_field(row, ["inspection_type"]),
+                find_field(row, ["overall_effectiveness", "overall_effectiveness_grade"]),
+                find_field(row, ["safeguarding", "safeguarding_is_effective"]),
+                json.dumps(row, ensure_ascii=False),
+                "ofsted_schools", info["label"], fetched
+            ))
+    finally:
+        f.close()
+
+    if len(staged) < 1000:
+        con.close()
+        raise RuntimeError(f"Ofsted row-count validation failed: only {len(staged)} usable rows")
+
+    con.execute("BEGIN")
+    try:
+        con.execute("DELETE FROM schools")
+        con.executemany("""
+          INSERT INTO schools
+          (urn, school_name, postcode, local_authority, phase, latest_inspection_date,
+           latest_inspection_type, overall_effectiveness, safeguarding, raw_json,
+           source_key, data_period, fetched_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, staged)
+        con.execute("""
+          INSERT INTO bulk_dataset_files
+          (source_key, discovered_url, file_name, data_period, sha256, downloaded_at,
+           validation_status, row_count, is_published)
+          VALUES ('ofsted_schools', ?, ?, ?, ?, ?, 'validated', ?, 1)
+        """, (info["url"], path.name, info["label"], digest, fetched, len(staged)))
+        con.execute("""
+          UPDATE dataset_publication_state
+          SET status='latest_available', last_checked_at=?
+          WHERE source_key='ofsted_schools'
+        """, (fetched,))
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+    return {
+        "status": "published",
+        "rows": len(staged),
+        "sha256": digest,
+        "label": info["label"],
+        "encoding": encoding_used,
+    }
+
+if __name__ == "__main__":
+    print(ingest())
                 find_field(row, ["phase_of_education", "phase"]),
                 find_field(row, ["inspection_end_date", "inspection_date", "latest_inspection_date"]),
                 find_field(row, ["inspection_type"]),
