@@ -40,40 +40,74 @@ def _table_count(table_name: str) -> int:
 
 
 def _bootstrap_missing_bulk_data():
+    """Ensure bulk datasets and school coordinates are actually usable.
+
+    Important:
+    A populated schools table does NOT mean school geography is complete.
+    We therefore check school_geography separately and enrich whenever it is
+    incomplete. No substitute or inferred values are created.
+    """
     try:
         schools_n = _table_count("schools")
         sales_n = _table_count("property_transactions")
         rent_n = _table_count("ons_rent_local_authority")
 
-        if schools_n > 0 and sales_n > 0 and rent_n > 0:
-            logger.info("Bulk bootstrap skipped: validated datasets already present.")
-            return
-
-        logger.info(
-            "Starting initial bulk bootstrap: schools=%s sales=%s rent=%s",
+        logger.warning(
+            "Bootstrap counts before refresh: schools=%s sales=%s rent=%s",
             schools_n,
             sales_n,
             rent_n,
         )
 
-        from refresh_bulk_sources import main as refresh_bulk
-        from enrich_school_geography import main as enrich_schools
+        # Refresh official bulk datasets only when at least one is missing.
+        if schools_n == 0 or sales_n == 0 or rent_n == 0:
+            from refresh_bulk_sources import main as refresh_bulk
+            logger.warning("Starting bulk source refresh.")
+            refresh_bulk()
 
-        refresh_bulk()
-        enrich_schools()
-        logger.info("Initial bulk bootstrap completed.")
+        # Re-read counts after bulk refresh.
+        schools_n = _table_count("schools")
+        school_geo_n = _table_count("school_geography")
+
+        logger.warning(
+            "School geography status: schools=%s geocoded=%s pending=%s",
+            schools_n,
+            school_geo_n,
+            max(0, schools_n - school_geo_n),
+        )
+
+        # Critical fix: do not skip geography just because schools exist.
+        if schools_n > 0 and school_geo_n < schools_n:
+            from enrich_school_geography import main as enrich_schools
+            logger.warning("Starting school geography enrichment.")
+            enrich_schools()
+
+            school_geo_n = _table_count("school_geography")
+            logger.warning(
+                "School geography enrichment finished: schools=%s geocoded=%s pending=%s",
+                schools_n,
+                school_geo_n,
+                max(0, schools_n - school_geo_n),
+            )
+
+        logger.warning("Initial data bootstrap completed.")
+
     except Exception:
-        logger.exception("Initial bulk bootstrap failed; no substitute data generated.")
+        logger.exception(
+            "Initial data bootstrap failed; no substitute data generated."
+        )
 
 
 @asynccontextmanager
 async def lifespan(app):
     start_scheduler()
+
     threading.Thread(
         target=_bootstrap_missing_bulk_data,
-        name="nazufi-initial-bulk-bootstrap",
+        name="nazufi-initial-data-bootstrap",
         daemon=True,
     ).start()
+
     try:
         yield
     finally:
@@ -82,7 +116,7 @@ async def lifespan(app):
 
 app = FastAPI(
     title="Nazufi UK Living Score API",
-    version="0.7.0",
+    version="0.7.1",
     lifespan=lifespan,
 )
 
@@ -119,15 +153,20 @@ def _resolve_area(postcode: str):
 
     fresh = lookup_postcode(pc)
     valid, message = validate_postcode_record(fresh)
+
     if not valid:
-        raise RuntimeError(f"Postcode source validation failed: {message}")
+        raise RuntimeError(
+            f"Postcode source validation failed: {message}"
+        )
 
     save_postcode_area(fresh)
     pc = fresh["postcode"]
     area = get_area(pc)
 
     if not area:
-        raise RuntimeError("Validated postcode could not be cached")
+        raise RuntimeError(
+            "Validated postcode could not be cached"
+        )
 
     return pc, area
 
@@ -148,15 +187,22 @@ def _refresh_live_for_area(pc: str, area: dict):
             )
 
             ok, message = validate_crime_snapshot(snapshot)
+
             if not ok:
-                raise RuntimeError(f"Police.uk validation failed: {message}")
+                raise RuntimeError(
+                    f"Police.uk validation failed: {message}"
+                )
 
             save_crime(pc, snapshot)
             crime = get_latest_crime(pc)
 
     except Exception as exc:
         crime_error = str(exc)
-        logger.warning("Police.uk refresh failed for %s: %s", pc, exc)
+        logger.warning(
+            "Police.uk refresh failed for %s: %s",
+            pc,
+            exc,
+        )
 
     flood = None
     flood_error = None
@@ -168,8 +214,11 @@ def _refresh_live_for_area(pc: str, area: dict):
         )
 
         ok, message = validate_flood_check(snapshot)
+
         if not ok:
-            raise RuntimeError(f"Environment Agency validation failed: {message}")
+            raise RuntimeError(
+                f"Environment Agency validation failed: {message}"
+            )
 
         save_flood(pc, snapshot)
 
@@ -191,8 +240,11 @@ def _refresh_live_for_area(pc: str, area: dict):
 
     if not crime:
         crime = {
-            "status": "unavailable",
-            "message": "Police.uk data could not be retrieved from the source.",
+            "status": "source_temporarily_unavailable",
+            "message": (
+                "Police.uk could not be refreshed at this time. "
+                "This does not mean there are no recorded incidents."
+            ),
             "source_error": crime_error,
         }
     else:
@@ -200,8 +252,11 @@ def _refresh_live_for_area(pc: str, area: dict):
 
     if not flood:
         flood = {
-            "status": "unavailable",
-            "message": "Current Environment Agency flood data could not be retrieved.",
+            "status": "source_temporarily_unavailable",
+            "message": (
+                "Environment Agency live data could not be refreshed at this time. "
+                "Use the official source link for the latest check."
+            ),
             "source_error": flood_error,
             "scope": "current flood alerts/warnings only",
         }
@@ -214,7 +269,7 @@ def root():
     return {
         "service": "Nazufi UK Living Score API",
         "status": "ok",
-        "version": "0.7.0",
+        "version": "0.7.1",
         "data_policy": "No source -> no score. No data -> no AI guess.",
     }
 
@@ -255,7 +310,9 @@ def postcode_view(postcode: str):
                 if _table_count("schools") > 0
                 else "update_pending"
             ),
-            "message": "Ofsted bulk data is loaded separately and never AI-filled.",
+            "message": (
+                "Ofsted bulk data is loaded separately and never AI-filled."
+            ),
         },
         "housing": {
             "status": (
@@ -263,7 +320,10 @@ def postcode_view(postcode: str):
                 if _table_count("property_transactions") > 0
                 else "update_pending"
             ),
-            "message": "HM Land Registry bulk data is loaded separately and never AI-filled.",
+            "message": (
+                "HM Land Registry bulk data is loaded separately "
+                "and never AI-filled."
+            ),
         },
         "score": {
             "status": "withheld",
@@ -286,18 +346,19 @@ def schools_near_postcode(postcode: str):
              latest_inspection_date, latest_inspection_type,
              overall_effectiveness, safeguarding, data_period, fetched_at
       FROM schools
-      WHERE UPPER(REPLACE(postcode,' ','')) = UPPER(REPLACE(?,' ',''))
+      WHERE UPPER(REPLACE(postcode,' ','')) =
+            UPPER(REPLACE(?,' ',''))
       ORDER BY school_name
     """, (pc,)).fetchall()
     con.close()
 
     return {
         "postcode": pc,
-        "status": "latest_available" if rows else "unavailable",
+        "status": "latest_available" if rows else "no_matching_data",
         "schools": [dict(r) for r in rows],
         "note": (
-            "No school is invented or distance-estimated. "
-            "Exact-postcode results only until validated coordinates are added."
+            "Exact-postcode Ofsted school records. "
+            "Nearby-radius results are available through /area-report."
         ),
     }
 
@@ -312,7 +373,8 @@ def property_sales(postcode: str):
              old_new, duration, town_city, district, county,
              source_release, fetched_at
       FROM property_transactions
-      WHERE UPPER(REPLACE(postcode,' ','')) = UPPER(REPLACE(?,' ',''))
+      WHERE UPPER(REPLACE(postcode,' ','')) =
+            UPPER(REPLACE(?,' ',''))
       ORDER BY transfer_date DESC, price DESC
       LIMIT 100
     """, (pc,)).fetchall()
@@ -320,21 +382,25 @@ def property_sales(postcode: str):
 
     return {
         "postcode": pc,
-        "status": "latest_available" if rows else "unavailable",
+        "status": "latest_available" if rows else "no_matching_data",
         "transactions": [dict(r) for r in rows],
         "attribution": (
-            "Contains HM Land Registry data © Crown copyright and database right 2021. "
-            "This data is licensed under the Open Government Licence v3.0."
+            "Contains HM Land Registry data © Crown copyright and "
+            "database right 2021. This data is licensed under the "
+            "Open Government Licence v3.0."
         ),
         "warning": (
-            "Recent Price Paid Data can be incomplete because registration "
-            "follows transactions. Current-month data must not be treated alone "
-            "as final market-volume evidence."
+            "Recent Price Paid Data can be incomplete because "
+            "registration follows transactions."
         ),
     }
 
 
-from area_service import nearby_schools, property_sales_prefix, ons_rent_for_area
+from area_service import (
+    nearby_schools,
+    property_sales_prefix,
+    ons_rent_for_area,
+)
 
 
 @app.get("/area-report/{postcode}")
@@ -360,8 +426,33 @@ def area_report(postcode: str):
     rent = ons_rent_for_area(area.get("admin_district"))
 
     schools_loaded = _table_count("schools") > 0
+    school_geo_count = _table_count("school_geography")
+    school_count = _table_count("schools")
+    school_geo_complete = (
+        school_count > 0 and school_geo_count >= school_count
+    )
+
     sales_loaded = _table_count("property_transactions") > 0
     rent_loaded = _table_count("ons_rent_local_authority") > 0
+
+    if schools:
+        school_status = "latest_available"
+        school_message = None
+    elif not schools_loaded:
+        school_status = "ingestion_pending"
+        school_message = "Ofsted dataset ingestion is currently pending."
+    elif not school_geo_complete:
+        school_status = "geography_enrichment_pending"
+        school_message = (
+            f"Ofsted data is loaded, but school location enrichment is "
+            f"still in progress ({school_geo_count}/{school_count})."
+        )
+    else:
+        school_status = "no_matching_data"
+        school_message = (
+            "No matching state-funded Ofsted school records were found "
+            "within 3 km in the currently loaded dataset."
+        )
 
     return {
         "postcode": pc,
@@ -369,43 +460,38 @@ def area_report(postcode: str):
         "crime": crime,
         "current_flood_context": flood,
         "schools": {
-            "status": (
-                "latest_available"
-                if schools
-                else ("unavailable" if schools_loaded else "update_pending")
-            ),
+            "status": school_status,
             "radius_km": 3.0,
             "items": schools,
-            "message": (
-                None
-                if schools
-                else (
-                    "No matching Ofsted schools were found within the validated radius."
-                    if schools_loaded
-                    else "Ofsted dataset ingestion is currently pending."
-                )
-            ),
+            "loaded_school_records": school_count,
+            "geocoded_school_records": school_geo_count,
+            "message": school_message,
         },
         "property_sales": {
             "status": (
                 "latest_available"
                 if sales
-                else ("unavailable" if sales_loaded else "update_pending")
+                else (
+                    "no_matching_data"
+                    if sales_loaded
+                    else "ingestion_pending"
+                )
             ),
             "scope": sale_scope,
             "items": sales,
             "attribution": (
-                "Contains HM Land Registry data © Crown copyright and database right 2021. "
-                "This data is licensed under the Open Government Licence v3.0."
+                "Contains HM Land Registry data © Crown copyright and "
+                "database right 2021. This data is licensed under the "
+                "Open Government Licence v3.0."
             ),
             "message": (
                 None
                 if sales
                 else (
-                    "No matching transactions were found in the currently "
-                    "published Price Paid Data scope."
+                    "No matching transactions were found in the "
+                    "currently published Price Paid Data scope."
                     if sales_loaded
-                    else "HM Land Registry dataset ingestion is currently pending."
+                    else "HM Land Registry ingestion is currently pending."
                 )
             ),
         },
@@ -413,7 +499,11 @@ def area_report(postcode: str):
             "status": (
                 "latest_available"
                 if rent
-                else ("unavailable" if rent_loaded else "update_pending")
+                else (
+                    "no_matching_data"
+                    if rent_loaded
+                    else "ingestion_pending"
+                )
             ),
             "geography": "local_authority",
             "item": rent,
@@ -423,15 +513,16 @@ def area_report(postcode: str):
                 else (
                     "No matching ONS local-authority rent row was found."
                     if rent_loaded
-                    else "ONS private-rent dataset ingestion is currently pending."
+                    else "ONS private-rent ingestion is currently pending."
                 )
             ),
         },
         "overall_score": {
             "status": "withheld",
             "reason": (
-                "Nazufi does not publish a combined score until every included "
-                "metric has a published formula, benchmark and validated source."
+                "Nazufi does not publish a combined score until every "
+                "included metric has a published formula, benchmark and "
+                "validated source."
             ),
         },
         "data_policy": "No source -> no score. No data -> no AI guess.",
@@ -459,8 +550,11 @@ def freshness():
         "sources": [dict(r) for r in rows],
         "dataset_counts": {
             "schools": _table_count("schools"),
+            "school_geography": _table_count("school_geography"),
             "property_transactions": _table_count("property_transactions"),
-            "ons_rent_local_authority": _table_count("ons_rent_local_authority"),
+            "ons_rent_local_authority": _table_count(
+                "ons_rent_local_authority"
+            ),
         },
         "policy": "No source -> no score. No data -> no AI guess.",
     }
@@ -469,6 +563,7 @@ def freshness():
 @app.get("/healthz")
 def healthz():
     con = connect()
+
     try:
         con.execute("SELECT 1").fetchone()
         db_ok = True
